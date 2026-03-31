@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# 1. Setup & Environment
+THREADS=$(nproc --all)
+# Apply high priority ONLY if already root (won't crash if not)
+[[ $EUID -eq 0 ]] && renice -n -15 -p $$ >/dev/null 2>&1
+
+RM_BIN=$(which rm)
+SEVENZ_BIN=$(which 7z)
+DU_BIN=$(which du)
+PWD_DIR=$(pwd)
+MANIFEST="/tmp/drain_manifest.$$"
+
+# 2. Help Menu
+show_help() {
+    echo "Usage: zip-drain <file.zip> [options]"
+    echo "       zip-drain -tst [options]"
+    echo ""
+    echo "Options:"
+    echo "  -h            Show this menu"
+    echo "  -tst          Test mode (Generates 1GB dummy archive)"
+    echo "  -dwd          Keep original archive (Extract only)"
+    echo "  -nw           No warnings (Skip all Y/N prompts)"
+    echo "  -del [num]    Batch delete size (Default: 20)"
+    exit 0
+}
+
+# 3. Cleanup Logic
+cleanup() {
+    [[ -f "$MANIFEST" ]] && $RM_BIN -f "$MANIFEST"
+    [[ -d "$PWD_DIR/test_data" ]] && $RM_BIN -rf "$PWD_DIR/test_data"
+    exit 1
+}
+trap cleanup SIGINT SIGTERM
+
+# 4. Test Mode (RESTORED WITH Y/N)
+run_test_mode() {
+    echo "[*] Generating 1GB test data..."
+    mkdir -p "$PWD_DIR/test_data"
+    for i in {1..60}; do 
+        dd if=/dev/zero of="$PWD_DIR/test_data/file_$i.dat" bs=1M count=17 2>/dev/null
+        echo -n "."
+    done
+    echo ""
+
+    if $WARN; then
+        read -p "[?] Create test archive? (y/N): " r_zip </dev/tty
+        [[ "${r_zip,,}" != "y" ]] && cleanup
+    fi
+
+    $SEVENZ_BIN a -tzip -mx0 -mmt=$THREADS "$PWD_DIR/test_1gb.zip" "$PWD_DIR/test_data/*" >/dev/null
+    $RM_BIN -rf "$PWD_DIR/test_data"
+    ARCHIVE="test_1gb.zip"
+    echo "[+] Test Archive Ready: $ARCHIVE"
+}
+
+# 5. Argument Parsing
+CHUNK_SIZE=20; DRAIN=true; TST_MODE=false; WARN=true;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -tst) TST_MODE=true ;;
+        -dwd) DRAIN=false ;;
+        -nw) WARN=false ;;
+        -del) CHUNK_SIZE="$2"; shift ;;
+        -h) show_help ;;
+        *) [[ -f "$1" ]] && ARCHIVE="$1" ;;
+    esac
+    shift
+done
+
+if $TST_MODE; then run_test_mode; fi
+[[ -z "$ARCHIVE" ]] && show_help
+
+# RESTORED: Safety Confirmation for Extraction
+if $WARN; then
+    read -p "[?] Proceed with draining $ARCHIVE? (y/N): " r_ext </dev/tty
+    [[ "${r_ext,,}" != "y" ]] && exit 0
+fi
+
+# 6. Processing Engine
+TARGET_DIR="${ARCHIVE%.*}"
+mkdir -p "$TARGET_DIR"
+
+$SEVENZ_BIN l -ba -slt "$ARCHIVE" 2>/dev/null | awk -F' = ' '/^Path = / {p=$2} /^Size = / {s=$2; print s"|"p}' | grep "|" > "$MANIFEST"
+TOTAL=$(wc -l < "$MANIFEST" 2>/dev/null || echo 0)
+
+COUNT=0; Q_COUNT=0; QUEUE=()
+echo "Processing: $ARCHIVE (Threads: $THREADS | Chunk: $CHUNK_SIZE)"
+
+while IFS='|' read -r EXP_SIZE F_PATH; do
+    [[ -z "$F_PATH" ]] && continue
+    ((COUNT++))
+    
+    $SEVENZ_BIN x "$ARCHIVE" -o"$TARGET_DIR" "$F_PATH" -y -aos -mmt=$THREADS >/dev/null 2>&1
+    
+    if $DRAIN; then
+        QUEUE+=("$F_PATH")
+        ((Q_COUNT++))
+        if [[ $Q_COUNT -ge $CHUNK_SIZE ]]; then
+            $SEVENZ_BIN d "$ARCHIVE" "${QUEUE[@]}" -y -mmt=$THREADS >/dev/null 2>&1
+            QUEUE=(); Q_COUNT=0
+        fi
+    fi
+
+    CUR_SIZE=$($DU_BIN -h "$ARCHIVE" 2>/dev/null | cut -f1 || echo "0")
+    printf "\rProgress: %d%% (%d/%d) Zip Size: %s    " "$((COUNT * 100 / TOTAL))" "$COUNT" "$TOTAL" "$CUR_SIZE"
+done < "$MANIFEST"
+
+# 7. Final Flush
+if [[ ${#QUEUE[@]} -gt 0 ]]; then
+    $SEVENZ_BIN d "$ARCHIVE" "${QUEUE[@]}" -y -mmt=$THREADS >/dev/null 2>&1
+fi
+
+$RM_BIN -f "$MANIFEST"
+if $DRAIN && [[ -f "$ARCHIVE" ]]; then $RM_BIN -f "$ARCHIVE"; fi
+
+echo -e "\n[+] Task complete. Files ready in: $TARGET_DIR/"
