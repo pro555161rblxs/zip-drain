@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# 1. Setup & Environment
+USER_NAME=${SUDO_USER:-$USER}
+USER_GID=$(id -g "$USER_NAME")
+[[ $EUID -ne 0 ]] && exec sudo "$0" "$@"
+
+THREADS=$(nproc --all)
+renice -n -15 -p $$ >/dev/null 2>&1
+
+RM_BIN=$(which rm)
+SEVENZ_BIN=$(which 7z)
+DU_BIN=$(which du)
+STAT_BIN=$(which stat)
+CHOWN_BIN=$(which chown)
+PWD_DIR=$(pwd)
+MANIFEST="/tmp/drain_manifest.$$"
+
+# 2. Help Menu
+show_help() {
+    echo "Usage: sudo ./drain <file.zip> [options]"
+    echo "       sudo ./drain -tst [options]"
+    echo ""
+    echo "Options:"
+    echo "  -h            Show this menu"
+    echo "  -tst          Test mode (1GB data generation)"
+    echo "  -dwd          Extract only (keep archive)"
+    echo "  -d            Debug mode (verbose output)"
+    echo "  -nw           No warnings (skip prompts)"
+    echo "  -del [num]    Batch delete size (Default: 20)"
+    exit 0
+}
+
+# 3. Cleanup Logic
+cleanup() {
+    [[ -f "$MANIFEST" ]] && $RM_BIN -f "$MANIFEST"
+    [[ -d "$PWD_DIR/test_data" ]] && $RM_BIN -rf "$PWD_DIR/test_data"
+    exit 1
+}
+trap cleanup SIGINT SIGTERM
+
+# 4. Test Mode
+run_test_mode() {
+    echo "[*] Generating test data..."
+    mkdir -p "$PWD_DIR/test_data"
+    for i in {1..60}; do 
+        dd if=/dev/zero of="$PWD_DIR/test_data/file_$i.dat" bs=1M count=17 2>/dev/null
+        echo -n "."
+    done
+    echo ""
+    
+    if $WARN; then
+        read -p "[?] Create test archive? (y/N): " r_zip </dev/tty
+        [[ "${r_zip,,}" != "y" ]] && cleanup
+    fi
+
+    $SEVENZ_BIN a -tzip -mx0 -mmt=$THREADS "$PWD_DIR/test_1gb.zip" "$PWD_DIR/test_data/*" >/dev/null
+    
+    if [[ ! -f "$PWD_DIR/test_1gb.zip" ]]; then
+        echo "[!] Error: Zip creation failed."
+        cleanup
+    fi
+
+    $RM_BIN -rf "$PWD_DIR/test_data"
+    ARCHIVE="test_1gb.zip"
+    echo "[+] Archive ready: $ARCHIVE ($($DU_BIN -h "$PWD_DIR/test_1gb.zip" | cut -f1))"
+}
+
+# 5. Argument Parsing
+CHUNK_SIZE=20; DRAIN=true; TST_MODE=false; WARN=true; DEBUG=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -tst) TST_MODE=true ;;
+        -dwd) DRAIN=false ;;
+        -d) DEBUG=true ;;
+        -nw) WARN=false ;;
+        -del) CHUNK_SIZE="$2"; shift ;;
+        -h) show_help ;;
+        *) [[ -f "$1" ]] && ARCHIVE="$1" ;;
+    esac
+    shift
+done
+
+if $TST_MODE; then run_test_mode; fi
+[[ -z "$ARCHIVE" ]] && show_help
+
+if $WARN; then
+    read -p "[?] Proceed with $ARCHIVE? (y/N): " r_ext </dev/tty
+    [[ "${r_ext,,}" != "y" ]] && exit 0
+fi
+
+TARGET_DIR="${ARCHIVE%.*}"
+mkdir -p "$TARGET_DIR"
+
+# 6. Archive Scan (Captures Size and Path)
+echo -n "Scanning $ARCHIVE... "
+$SEVENZ_BIN l -ba -slt "$ARCHIVE" 2>/dev/null | awk -F' = ' '/^Path = / {p=$2} /^Size = / {s=$2; print s"|"p}' | grep "|" > "$MANIFEST"
+TOTAL=$(wc -l < "$MANIFEST" 2>/dev/null || echo 0)
+echo "Done ($TOTAL files)."
+
+# 7. Processing Engine
+COUNT=0; Q_COUNT=0; QUEUE=()
+echo "Processing: $ARCHIVE (Threads: $THREADS | Chunk: $CHUNK_SIZE)"
+
+while IFS='|' read -r EXP_SIZE F_PATH; do
+    [[ -z "$F_PATH" ]] && continue
+    ((COUNT++))
+    
+    # Extraction
+    $SEVENZ_BIN x "$ARCHIVE" -o"$TARGET_DIR" "$F_PATH" -y -aos -mmt=$THREADS >/dev/null 2>&1
+    
+    # Validation Phase
+    if ! $DEBUG; then
+        printf "\r[%-20s] %d%% Validating files...    " "$(printf '#%.0s' $(seq 1 $(( (COUNT * 100 / TOTAL) / 5 )) ))" "$((COUNT * 100 / TOTAL))"
+    fi
+
+    # Check existence and size (Metadata check)
+    if [[ ! -e "$TARGET_DIR/$F_PATH" ]]; then
+        echo -e "\n[!] VALIDATION FAILED: $F_PATH missing after extraction."
+        cleanup
+    fi
+
+    REAL_SIZE=$($STAT_BIN -c%s "$TARGET_DIR/$F_PATH" 2>/dev/null || echo 0)
+    if [[ "$REAL_SIZE" -ne "$EXP_SIZE" ]]; then
+        echo -e "\n[!] VALIDATION FAILED: $F_PATH size mismatch."
+        cleanup
+    fi
+
+    if $DRAIN; then
+        QUEUE+=("$F_PATH")
+        ((Q_COUNT++))
+        
+        # Batch deletion
+        if [[ $Q_COUNT -ge $CHUNK_SIZE ]]; then
+            $SEVENZ_BIN d "$ARCHIVE" "${QUEUE[@]}" -y -mmt=$THREADS >/dev/null 2>&1
+            sync
+            QUEUE=(); Q_COUNT=0
+        fi
+    fi
+
+    # UI Progress (Standard)
+    if ! $DEBUG; then
+        CUR_SIZE=$($DU_BIN -h "$ARCHIVE" 2>/dev/null | cut -f1 || echo "0")
+        printf "\r[%-20s] %d%% (%d/%d) Size: %s    " "$(printf '#%.0s' $(seq 1 $(( (COUNT * 100 / TOTAL) / 5 )) ))" "$((COUNT * 100 / TOTAL))" "$COUNT" "$TOTAL" "$CUR_SIZE"
+    fi
+done < "$MANIFEST"
+
+# Final queue flush
+if [[ ${#QUEUE[@]} -gt 0 ]]; then
+    $SEVENZ_BIN d "$ARCHIVE" "${QUEUE[@]}" -y -mmt=$THREADS >/dev/null 2>&1
+fi
+
+# Finalization
+$CHOWN_BIN -R "$USER_NAME:$USER_GID" "$TARGET_DIR"
+$RM_BIN -f "$MANIFEST"
+if $DRAIN && [[ -f "$ARCHIVE" ]]; then $RM_BIN -f "$ARCHIVE"; fi
+
+echo -e "\n[+] Task complete. Files verified and located in: $TARGET_DIR/"
